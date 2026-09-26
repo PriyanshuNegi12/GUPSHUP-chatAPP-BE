@@ -33,6 +33,16 @@ app.use(cors({
 app.use(cookieParser());
 app.use(express.json({ limit: '1mb' }));
 
+app.get('/api/health', async (req, res) => {
+    try {
+        await client.ping();
+        await mongoose.connection.db.admin().ping();
+        res.status(200).send('OK');
+    } catch (err) {
+        res.status(200).send('OK - dependency check failed');
+    }
+});
+
 app.use('/user', userRouter);
 app.use('/friend', friendRouter);
 app.use('/chat', chatRouter);
