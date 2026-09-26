@@ -18,6 +18,16 @@ const io = new Server(server, {
         origin: process.env.CLIENT_URL,
         credentials: true,
     },
+    // How fast we notice a friend went offline without a clean disconnect
+    // (wifi off, airplane mode, laptop put to sleep, tab killed by the OS —
+    // none of these send a proper close, so Socket.IO can only tell via
+    // this heartbeat). Defaults are pingInterval 25000 / pingTimeout 20000,
+    // i.e. up to ~45s before "online" is corrected. This brings worst case
+    // down to ~15s: every 10s the server pings each socket, and if a pong
+    // doesn't come back within 5s it's declared dead -> disconnect fires ->
+    // online:{userId} is cleared -> presence:offline is broadcast.
+    pingInterval: 10000,
+    pingTimeout: 5000,
 });
 app.set('io', io);
 
