@@ -64,9 +64,15 @@ app.use((err, req, res, next) => {
     res.status(500).json({ message: "Something went wrong" });
 });
 
+async function clearStalePresence() {
+    const keys = await client.keys('online:*');
+    if (keys.length) await client.del(keys);
+}
+
 async function initialConnections() {
     await Promise.all([main(), client.connect()]);
     console.log("Connected DB!!!!!!!");
+    await clearStalePresence();
     server.listen(process.env.PORT_NUMBER, () => {
         console.log("Listening!!!!!!");
     });
