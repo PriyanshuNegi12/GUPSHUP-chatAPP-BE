@@ -1,4 +1,3 @@
-const nodemailer = require("nodemailer");
 const crypto = require("crypto");
 const client = require("../Config/Redis");
 
@@ -10,53 +9,19 @@ function createOTP() {
     return crypto.randomInt(100000, 1000000).toString();
 }
 
-const transporter = nodemailer.createTransport({
-  service: "gmail",
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_APP_PASSWORD,
-  },
-  // Force IPv4. Node's DNS resolver often returns Gmail's IPv6 address
-  // first, and a lot of hosting providers only route IPv4 outbound —
-  // that mismatch is what causes "connect ENETUNREACH 2404:..." even
-  // though the credentials and everything else are fine.
-  family: 4,
-  connectionTimeout: 10000, // time to establish the TCP connection
-  greetingTimeout: 10000,   // time to get the SMTP greeting after connecting
-  socketTimeout: 15000,     // time for the whole send before giving up
-});
-
-async function generateOTP(data) {
-    const email = data.emailId;
-
-    const onCooldown = await client.exists(`OTP:cooldown:${email}`);
-    if (onCooldown) {
-        const ttl = await client.ttl(`OTP:cooldown:${email}`);
-        const err = new Error(`Please wait ${ttl} seconds before requesting another OTP`);
-        err.status = 429;
-        throw err;
-    }
-
-    const otp = createOTP();
-
-    // Store the OTP + cooldown FIRST and return right after — this is what
-    // the client is actually waiting on. The email send below is kicked off
-    // but deliberately NOT awaited: an SMTP round-trip (connect, auth,
-    // transfer) can take several seconds even when it eventually succeeds,
-    // which was exactly what made signup hang — sometimes long enough to
-    // hit the hosting platform's own gateway timeout, which kills the
-    // connection with no usable error ever reaching the browser. The OTP is
-    // already valid in Redis by the time we respond, so the user can move
-    // straight to the "enter code" screen without waiting on mail delivery.
-    await client.set(`OTP:${email}`, otp, { EX: OTP_TTL });
-    await client.set(`OTP:cooldown:${email}`, '1', { EX: RESEND_COOLDOWN });
-    await client.del(`OTP:attempts:${email}`); // fresh OTP, fresh attempt count
-
-    transporter.sendMail({
-        from: `"GUPSHUP" <${process.env.EMAIL_USER}>`,
-        to: email,
-        subject: "Your GUPSHUP Verification Code",
-        text: `
+async function sendOTPEmail(email, otp) {
+    const res = await fetch("https://api.brevo.com/v3/smtp/email", {
+        method: "POST",
+        headers: {
+            "api-key": process.env.BREVO_API_KEY,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        body: JSON.stringify({
+            sender: { name: "GUPSHUP", email: process.env.BREVO_SENDER_EMAIL },
+            to: [{ email }],
+            subject: "Your GUPSHUP Verification Code",
+            textContent: `
 Dear User,
 
 We received a request to verify the email address associated with your GUPSHUP account.
@@ -75,12 +40,44 @@ This is an automated message. Please do not reply to this email.
 
 Regards,
 GUPSHUP Team
-`
-    }).catch((err) => {
-        // fire-and-forget: log it so a real delivery failure (bad
-        // credentials, blocked network, etc.) is still visible to you,
-        // even though the user's request has already succeeded
-        console.error(`[OTP email] failed to send to ${email}:`, err);
+`,
+        }),
+    });
+
+    if (!res.ok) {
+        const errBody = await res.text();
+        throw new Error(`Brevo failed: ${res.status} ${errBody}`);
+    }
+}
+
+async function generateOTP(data) {
+    const email = data.emailId;
+
+    const onCooldown = await client.exists(`OTP:cooldown:${email}`);
+    if (onCooldown) {
+        const ttl = await client.ttl(`OTP:cooldown:${email}`);
+        const err = new Error(`Please wait ${ttl} seconds before requesting another OTP`);
+        err.status = 429;
+        throw err;
+    }
+
+    const otp = createOTP();
+
+    // Store the OTP + cooldown FIRST and return right after — this is what
+    // the client is actually waiting on. The email send below is kicked off
+    // but deliberately NOT awaited: even an HTTP call to Brevo can add a
+    // noticeable delay, and we don't want signup to hang on mail delivery.
+    // The OTP is already valid in Redis by the time we respond, so the user
+    // can move straight to the "enter code" screen without waiting on it.
+    await client.set(`OTP:${email}`, otp, { EX: OTP_TTL });
+    await client.set(`OTP:cooldown:${email}`, '1', { EX: RESEND_COOLDOWN });
+    await client.del(`OTP:attempts:${email}`); // fresh OTP, fresh attempt count
+
+    sendOTPEmail(email, otp).catch((err) => {
+        // fire-and-forget: log it so a real delivery failure (bad API key,
+        // unverified sender, etc.) is still visible to you, even though the
+        // user's request has already succeeded
+        console.error(`[OTP email] failed to send to ${email}:`, err.message);
     });
 
     return otp;
