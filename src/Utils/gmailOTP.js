@@ -16,11 +16,11 @@ const transporter = nodemailer.createTransport({
     user: process.env.EMAIL_USER,
     pass: process.env.EMAIL_APP_PASSWORD,
   },
-  // Without these, a blocked/slow SMTP connection (firewall, wrong network,
-  // bad credentials that hang instead of failing fast) makes sendMail()
-  // hang for minutes — and since the register route awaits it before
-  // responding, the client's signup request just spins forever with no
-  // error ever coming back. These make it fail fast and loudly instead.
+  // Force IPv4. Node's DNS resolver often returns Gmail's IPv6 address
+  // first, and a lot of hosting providers only route IPv4 outbound —
+  // that mismatch is what causes "connect ENETUNREACH 2404:..." even
+  // though the credentials and everything else are fine.
+  family: 4,
   connectionTimeout: 10000, // time to establish the TCP connection
   greetingTimeout: 10000,   // time to get the SMTP greeting after connecting
   socketTimeout: 15000,     // time for the whole send before giving up
@@ -39,14 +39,27 @@ async function generateOTP(data) {
 
     const otp = createOTP();
 
-    await transporter.sendMail({
-        from: `"Vartala" <${process.env.EMAIL_USER}>`,
+    // Store the OTP + cooldown FIRST and return right after — this is what
+    // the client is actually waiting on. The email send below is kicked off
+    // but deliberately NOT awaited: an SMTP round-trip (connect, auth,
+    // transfer) can take several seconds even when it eventually succeeds,
+    // which was exactly what made signup hang — sometimes long enough to
+    // hit the hosting platform's own gateway timeout, which kills the
+    // connection with no usable error ever reaching the browser. The OTP is
+    // already valid in Redis by the time we respond, so the user can move
+    // straight to the "enter code" screen without waiting on mail delivery.
+    await client.set(`OTP:${email}`, otp, { EX: OTP_TTL });
+    await client.set(`OTP:cooldown:${email}`, '1', { EX: RESEND_COOLDOWN });
+    await client.del(`OTP:attempts:${email}`); // fresh OTP, fresh attempt count
+
+    transporter.sendMail({
+        from: `"GUPSHUP" <${process.env.EMAIL_USER}>`,
         to: email,
-        subject: "Your Vartala Verification Code",
+        subject: "Your GUPSHUP Verification Code",
         text: `
 Dear User,
 
-We received a request to verify the email address associated with your Vartala account.
+We received a request to verify the email address associated with your GUPSHUP account.
 
 Your verification code is:
 
@@ -54,20 +67,21 @@ ${otp}
 
 This verification code is valid for 5 minutes and can be used only once.
 
-For your security, please do not share this code with anyone. Vartala will never ask you to disclose your verification code or password.
+For your security, please do not share this code with anyone. GUPSHUP will never ask you to disclose your verification code or password.
 
 If you did not request this verification code, no further action is required. You may safely ignore this email.
 
 This is an automated message. Please do not reply to this email.
 
 Regards,
-Vartala Team
+GUPSHUP Team
 `
+    }).catch((err) => {
+        // fire-and-forget: log it so a real delivery failure (bad
+        // credentials, blocked network, etc.) is still visible to you,
+        // even though the user's request has already succeeded
+        console.error(`[OTP email] failed to send to ${email}:`, err);
     });
-
-    await client.set(`OTP:${email}`, otp, { EX: OTP_TTL });
-    await client.set(`OTP:cooldown:${email}`, '1', { EX: RESEND_COOLDOWN });
-    await client.del(`OTP:attempts:${email}`); // fresh OTP, fresh attempt count
 
     return otp;
 }

@@ -81,8 +81,13 @@ const userRegister = async (req, res) => {
 
     } catch (err) {
         if (err.code === 11000) return res.status(409).json({ message: "Email or username already taken" });
-        console.error("[userRegister] failed:", err); // was silently swallowed — this is why signup looked like it did "nothing"
-        res.status(err.status || 400).json({ message: err.message });
+        console.error("[userRegister] failed:", err);
+        // Only errors we deliberately threw (duplicate account, bad OTP, rate
+        // limit — all of which set err.status) are safe to show verbatim.
+        // Anything else (network/DNS/SMTP failures, etc.) is an internal
+        // detail the user shouldn't see raw — mask it with a generic message.
+        if (err.status) return res.status(err.status).json({ message: err.message });
+        res.status(500).json({ message: "Something went wrong. Please try again in a moment." });
     }
 };
 
