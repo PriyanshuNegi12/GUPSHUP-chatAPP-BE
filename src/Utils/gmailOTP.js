@@ -16,6 +16,14 @@ const transporter = nodemailer.createTransport({
     user: process.env.EMAIL_USER,
     pass: process.env.EMAIL_APP_PASSWORD,
   },
+  // Without these, a blocked/slow SMTP connection (firewall, wrong network,
+  // bad credentials that hang instead of failing fast) makes sendMail()
+  // hang for minutes — and since the register route awaits it before
+  // responding, the client's signup request just spins forever with no
+  // error ever coming back. These make it fail fast and loudly instead.
+  connectionTimeout: 10000, // time to establish the TCP connection
+  greetingTimeout: 10000,   // time to get the SMTP greeting after connecting
+  socketTimeout: 15000,     // time for the whole send before giving up
 });
 
 async function generateOTP(data) {

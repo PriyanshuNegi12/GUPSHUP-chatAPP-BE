@@ -81,6 +81,7 @@ const userRegister = async (req, res) => {
 
     } catch (err) {
         if (err.code === 11000) return res.status(409).json({ message: "Email or username already taken" });
+        console.error("[userRegister] failed:", err); // was silently swallowed — this is why signup looked like it did "nothing"
         res.status(err.status || 400).json({ message: err.message });
     }
 };
