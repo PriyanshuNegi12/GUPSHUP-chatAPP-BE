@@ -62,11 +62,12 @@ app.use((err, req, res, next) => {
 async function scanAndDelete(pattern) {
     const keys = [];
     for await (const key of client.scanIterator({ MATCH: pattern, COUNT: 100 })) {
-        if (key) keys.push(key);     
+        if (typeof key === 'string' && key.length > 0) keys.push(key);
+        else if (Buffer.isBuffer(key) && key.length > 0) keys.push(key.toString());
     }
-    if (keys.length === 0) return;   
-    for (const key of keys) {      
-        await client.del(key);
+    if (keys.length === 0) return;          // ← never send empty DEL
+    for (const key of keys) {
+        await client.del(key);              // ← one key per call
     }
 }
 
