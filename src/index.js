@@ -62,9 +62,12 @@ app.use((err, req, res, next) => {
 async function scanAndDelete(pattern) {
     const keys = [];
     for await (const key of client.scanIterator({ MATCH: pattern, COUNT: 100 })) {
-        keys.push(key);
+        if (key) keys.push(key);     
     }
-    if (keys.length) await client.del(...keys);
+    if (keys.length === 0) return;   
+    for (const key of keys) {      
+        await client.del(key);
+    }
 }
 
 async function clearStalePresence() {
