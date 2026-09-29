@@ -1,15 +1,16 @@
 const loadAuthenticatedUser = require('./auth');
+const sendError = require('../Utils/sendError');
 
 const adminMiddleware = async (req, res, next) => {
     try {
         const { user, payload, token } = await loadAuthenticatedUser(req);
-        if (user.role != 'admin') throw new Error("User Doesn't Exists");
+        if (user.role !== 'admin') throw new Error("Admins only");
         req.result = user;
         req.tokenPayload = payload;
         req.token = token;
         next();
     } catch (err) {
-        res.status(401).send("Error:  " + err);
+        sendError(res, 401, "Session expired. Please log in again.");
     }
 };
 

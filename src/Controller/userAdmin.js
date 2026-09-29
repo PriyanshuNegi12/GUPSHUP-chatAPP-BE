@@ -3,11 +3,15 @@ const User = require('../Models/user');
 const isId = (v) => typeof v === 'string' && /^[0-9a-f]{24}$/i.test(v);
 const PUBLIC_ADMIN_FIELDS = 'username firstname lastname emailId role isActive avatar createdAt lastSeenAt';
 
+function escapeRegex(str) {
+    return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 const listUsers = async (req, res) => {
     try {
         const page = Math.max(1, parseInt(req.query.page) || 1);
         const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 50));
-        const q = typeof req.query.q === 'string' ? req.query.q.trim().toLowerCase() : '';
+        const q = typeof req.query.q === 'string' ? escapeRegex(req.query.q.trim().toLowerCase()) : '';
 
         const filter = q
             ? { $or: [{ username_lower: { $regex: q } }, { emailId: { $regex: q } }] }

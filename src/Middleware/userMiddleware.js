@@ -1,14 +1,16 @@
+// BackEnd/src/Middleware/userMiddleware.js
 const loadAuthenticatedUser = require('./auth');
+const sendError = require('../Utils/sendError');
 
 const userMiddleware = async (req, res, next) => {
     try {
         const { user, payload, token } = await loadAuthenticatedUser(req);
         req.result = user;
-        req.tokenPayload = payload; // NEW: so logout/deleteProfile don't need to re-decode
-        req.token = token;          // NEW: same reason
+        req.tokenPayload = payload;
+        req.token = token;
         next();
     } catch (err) {
-        res.status(401).send("Error:  " + err);
+        sendError(res, 401, "Session expired. Please log in again.");
     }
 };
 

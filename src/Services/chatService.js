@@ -110,11 +110,20 @@ async function markRead(io, { me, conversationId }) {
         conversationId: String(conversationId), userId: String(me), readAt: now,
     });
 
-    const others = await Member.find({ conversation: conversationId, user: { $ne: me } })
-        .select('lastReadAt').lean();
-    const allRead = others.length > 0 && others.every((m) => m.lastReadAt && m.lastReadAt >= now);
-    if (allRead) {
-        io.to(String(conversationId)).emit("readByAll", { conversationId: String(conversationId), upTo: now });
+    const latestMessage = await Message.findOne({ conversation: conversationId, deletedAt: null })
+        .sort({ createdAt: -1 })
+        .select('createdAt')
+        .lean();
+
+    if (latestMessage) {
+        const allMembers = await Member.find({ conversation: conversationId })
+            .select('lastReadAt').lean();
+        const allRead = allMembers.every((m) => m.lastReadAt && m.lastReadAt >= latestMessage.createdAt);
+        if (allRead) {
+            io.to(String(conversationId)).emit("readByAll", {
+                conversationId: String(conversationId), upTo: latestMessage.createdAt,
+            });
+        }
     }
 
     return { lastReadAt: now };

@@ -7,6 +7,7 @@ const { validateOTP, generateOTP } = require("../Utils/gmailOTP");
 const { recordFailedLogin, clearLoginAttempts } = require('../Middleware/rateLimiter');
 const Friendship = require("../Models/friendship");
 const { authCookieOptions, clearCookieOptions } = require('../Utils/cookieOptions');
+const sendError = require('../Utils/sendError');
 
 // Shared by userRegister and adminRegister — both do the same
 // "no OTP -> send one" / "OTP present -> verify + create" flow.
@@ -25,7 +26,13 @@ async function registerWithOTP({ emailId, username, otp, firstname, password, ro
     }
 
     if (!await validateOTP({ emailId, otp })) {
-        throw new Error("Invalid OTP");
+        // FIX: this was a plain, untyped Error, so userRegister's catch
+        // block (which only trusts err.status for the real message) fell
+        // through to a generic 500 "Something went wrong" instead of
+        // telling the user their OTP was wrong.
+        const err = new Error("Invalid OTP");
+        err.status = 400;
+        throw err;
     }
 
     const user = await User.create({
@@ -108,10 +115,11 @@ const adminRegister = async (req, res) => {
 
         if (result.otpSent) return res.status(200).json({ message: "OTP sent to your email" });
 
-        res.status(201).send("User Registered Successfully");
+        res.status(201).json({ message: "User registered successfully" });
     } catch (err) {
-        if (err.code === 11000 || err.status === 409) return res.status(409).send("Email or username already taken");
-        res.status(err.status || 400).send("Error: " + err.message);
+        if (err.code === 11000 || err.status === 409) return sendError(res, 409, "Email or username already taken");
+        console.error("[adminRegister] failed:", err);
+        sendError(res, err.status || 400, err.status ? err.message : "Something went wrong. Please try again.");
     }
 };
 
@@ -214,7 +222,13 @@ const userLogin = async (req, res) => {
         });
 
     } catch (err) {
-        res.status(401).send("Error: " + err);
+        // FIX: was res.status(401).send("Error: " + err) — a raw string.
+        // The frontend reads error.response?.data?.message, which is
+        // undefined for a plain string body, so a wrong password always
+        // showed axios's generic "Request failed with status code 401"
+        // instead of an actual message.
+        if (!err.status) console.error("[userLogin] failed:", err);
+        sendError(res, err.status || 401, err.status ? err.message : "Invalid credentials");
     }
 };
 
@@ -224,10 +238,10 @@ const userLogout = async (req, res) => {
         await client.set(`token:${token}`, 'blocked');
         await client.expireAt(`token:${token}`, tokenPayload.exp);
         res.cookie("token", "", clearCookieOptions());
-        res.send("Logged Out Successfull");
+        res.status(200).json({ message: "Logged out successfully" });
 
     } catch (err) {
-        res.status(401).send("Error:  " + err);
+        sendError(res, 401, "Could not log out. Please try again.");
     }
 };
 

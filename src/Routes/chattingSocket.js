@@ -2,12 +2,13 @@ const jwt = require('jsonwebtoken');
 const User = require('../Models/user');
 const Member = require('../Models/member');
 const Message = require('../Models/message');
-const Friendship = require('../Models/friendship'); // NEW
+const Friendship = require('../Models/friendship');
 const client = require('../Config/Redis');
 const chatService = require('../Services/chatService');
 
 const isId = (v) => typeof v === 'string' && /^[0-9a-f]{24}$/i.test(v);
 const PUBLIC_CALL_FIELDS = 'username firstname avatar';
+const PENDING_CALL_TTL = 45; // a bit longer than the client's 30s ring timeout, so it always wins the race
 
 function parseCookieHeader(raw) {
     const out = {};
@@ -34,19 +35,46 @@ async function getFriendIds(me) {
 
 const getPairKey = (a, b) => [String(a), String(b)].sort().join('_');
 
-// NEW: who a user is currently on a call with — a simple string mapping in
-// Redis (not a set), since a person can only be on one call at a time here
+// who a user is currently on an ANSWERED call with
 async function getCallPeer(userId) {
     return client.get(`callpeer:${userId}`);
 }
 async function setCallPeer(a, b) {
     await Promise.all([
-        client.set(`callpeer:${a}`, b, { EX: 4 * 60 * 60 }), // 4h safety TTL in case cleanup is ever missed
+        client.set(`callpeer:${a}`, b, { EX: 4 * 60 * 60 }),
         client.set(`callpeer:${b}`, a, { EX: 4 * 60 * 60 }),
     ]);
 }
 async function clearCallPeer(a, b) {
     await Promise.all([client.del(`callpeer:${a}`), b ? client.del(`callpeer:${b}`) : null]);
+}
+
+// NEW: tracks a call that's RINGING but not yet answered. Without this,
+// call:answer / call:reject / call:ice-candidate / call:end had no way to
+// verify the sender was actually part of a real call — any logged-in user
+// could forge these events against any other user id (hijack/kill a call,
+// or falsely mark someone as busy for 4 hours).
+//
+// callpending:{calleeId}  -> { from: callerId, callId }   (who's calling ME)
+// callringing:{callerId}  -> calleeId                     (who I'M calling)
+// Both expire on their own if nothing happens, so a crashed process never
+// leaves someone stuck "in a call" forever.
+async function setPendingCall(callerId, calleeId, callId) {
+    await Promise.all([
+        client.set(`callpending:${calleeId}`, JSON.stringify({ from: callerId, callId: callId || null }), { EX: PENDING_CALL_TTL }),
+        client.set(`callringing:${callerId}`, calleeId, { EX: PENDING_CALL_TTL }),
+    ]);
+}
+async function getPendingCall(calleeId) {
+    const raw = await client.get(`callpending:${calleeId}`);
+    if (!raw) return null;
+    try { return JSON.parse(raw); } catch { return null; }
+}
+async function clearPending(callerId, calleeId) {
+    await Promise.all([
+        calleeId ? client.del(`callpending:${calleeId}`) : null,
+        callerId ? client.del(`callringing:${callerId}`) : null,
+    ]);
 }
 
 function chattingSocket(io) {
@@ -206,12 +234,12 @@ function chattingSocket(io) {
             }
         });
 
-        // ================= NEW: WebRTC call signaling =================
+        // ================= WebRTC call signaling =================
         // This server never touches media — only relays SDP offers/answers
-        // and ICE candidates between two friends' sockets. All the actual
+        // and ICE candidates between two friends' sockets. All actual
         // audio/video routing happens peer-to-peer in the browsers.
 
-        socket.on("call:offer", async ({ toUserId, conversationId, offer, callType } = {}, callback) => {
+        socket.on("call:offer", async ({ toUserId, conversationId, offer, callType, callId } = {}, callback) => {
             try {
                 if (!isId(toUserId) || toUserId === me) return callback?.({ ok: false, reason: "invalid" });
                 if (!offer || !['audio', 'video'].includes(callType)) return callback?.({ ok: false, reason: "invalid" });
@@ -222,14 +250,17 @@ function chattingSocket(io) {
                 const isOnline = (await client.sCard(`online:${toUserId}`)) > 0;
                 if (!isOnline) return callback?.({ ok: false, reason: "offline" });
 
-                const [myPeer, theirPeer] = await Promise.all([getCallPeer(me), getCallPeer(toUserId)]);
+                const [myPeer, theirPeer, theirPending] = await Promise.all([
+                    getCallPeer(me), getCallPeer(toUserId), getPendingCall(toUserId),
+                ]);
                 if (myPeer) return callback?.({ ok: false, reason: "already-in-call" });
-                if (theirPeer) {
+                if (theirPeer || theirPending) {
                     io.to(me).emit('call:busy', { userId: toUserId });
                     return callback?.({ ok: false, reason: "busy" });
                 }
 
                 const caller = await User.findById(me).select(PUBLIC_CALL_FIELDS).lean();
+                await setPendingCall(me, toUserId, callId);
 
                 io.to(toUserId).emit('call:incoming', {
                     fromUserId: me,
@@ -237,6 +268,7 @@ function chattingSocket(io) {
                     conversationId,
                     offer,
                     callType,
+                    callId,
                 });
 
                 callback?.({ ok: true });
@@ -246,9 +278,13 @@ function chattingSocket(io) {
             }
         });
 
-        socket.on("call:answer", async ({ toUserId, answer } = {}) => {
+        socket.on("call:answer", async ({ toUserId, answer, callId } = {}) => {
             try {
                 if (!isId(toUserId) || !answer) return;
+                const pending = await getPendingCall(me); // is someone actually ringing me, and is it them?
+                if (!pending || pending.from !== toUserId || (callId && pending.callId && pending.callId !== callId)) return;
+
+                await clearPending(toUserId, me);
                 await setCallPeer(me, toUserId); // call is now considered connected
                 io.to(toUserId).emit('call:answer', { fromUserId: me, answer });
             } catch (err) {
@@ -256,20 +292,54 @@ function chattingSocket(io) {
             }
         });
 
-        socket.on("call:ice-candidate", ({ toUserId, candidate } = {}) => {
+        socket.on("call:ice-candidate", async ({ toUserId, candidate } = {}) => {
             if (!isId(toUserId) || !candidate) return;
+            // Candidates start flowing before the answer, so "active call"
+            // alone isn't enough — also allow while either side is ringing.
+            const [peer, iAmRingingThem, theyAreRingingMe] = await Promise.all([
+                getCallPeer(me),
+                client.get(`callringing:${me}`),
+                getPendingCall(me),
+            ]);
+            const authorized = peer === toUserId
+                || iAmRingingThem === toUserId
+                || (theyAreRingingMe && theyAreRingingMe.from === toUserId);
+            if (!authorized) return;
+
             io.to(toUserId).emit('call:ice-candidate', { fromUserId: me, candidate });
         });
 
         socket.on("call:reject", async ({ toUserId } = {}) => {
             if (!isId(toUserId)) return;
+            const pending = await getPendingCall(me);
+            if (pending && pending.from === toUserId) await clearPending(toUserId, me);
             io.to(toUserId).emit('call:rejected', { fromUserId: me });
         });
 
         socket.on("call:end", async ({ toUserId } = {}) => {
             try {
-                if (isId(toUserId)) io.to(toUserId).emit('call:ended', { fromUserId: me });
-                await clearCallPeer(me, isId(toUserId) ? toUserId : undefined);
+                if (!isId(toUserId)) return;
+
+                const peer = await getCallPeer(me);
+                if (peer === toUserId) {
+                    io.to(toUserId).emit('call:ended', { fromUserId: me });
+                    await clearCallPeer(me, toUserId);
+                    return;
+                }
+
+                // not yet answered — I might be the caller cancelling, or the
+                // callee hanging up before formally rejecting
+                const [iAmRingingThem, theyAreRingingMe] = await Promise.all([
+                    client.get(`callringing:${me}`),
+                    getPendingCall(me),
+                ]);
+                if (iAmRingingThem === toUserId) {
+                    io.to(toUserId).emit('call:ended', { fromUserId: me });
+                    await clearPending(me, toUserId);
+                } else if (theyAreRingingMe && theyAreRingingMe.from === toUserId) {
+                    io.to(toUserId).emit('call:ended', { fromUserId: me });
+                    await clearPending(toUserId, me);
+                }
             } catch (err) {
                 console.error("call:end failed:", err);
             }
@@ -285,11 +355,24 @@ function chattingSocket(io) {
                     const now = new Date();
                     await User.updateOne({ _id: me }, { lastSeenAt: now });
 
-                    // NEW: if this was the last tab/device and they were mid-call, notify the peer
-                    const peer = await getCallPeer(me);
+                    // if this was the last tab/device and they were mid-call
+                    // (answered or still ringing either direction), notify the peer
+                    const [peer, theyAreRingingMe, iAmRingingThem] = await Promise.all([
+                        getCallPeer(me),
+                        getPendingCall(me),
+                        client.get(`callringing:${me}`),
+                    ]);
                     if (peer) {
                         io.to(peer).emit('call:ended', { fromUserId: me });
                         await clearCallPeer(me, peer);
+                    }
+                    if (theyAreRingingMe) {
+                        io.to(theyAreRingingMe.from).emit('call:ended', { fromUserId: me });
+                        await clearPending(theyAreRingingMe.from, me);
+                    }
+                    if (iAmRingingThem) {
+                        io.to(iAmRingingThem).emit('call:ended', { fromUserId: me });
+                        await clearPending(me, iAmRingingThem);
                     }
 
                     const friendIds = await getFriendIds(me);

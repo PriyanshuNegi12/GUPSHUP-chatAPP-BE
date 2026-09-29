@@ -1,12 +1,51 @@
 const crypto = require("crypto");
 const client = require("../Config/Redis");
 
-const OTP_TTL = 300;          // 5 minutes
-const RESEND_COOLDOWN = 60;   // 60 seconds
+const OTP_TTL = 300;
+const RESEND_COOLDOWN = 60;
 const MAX_ATTEMPTS = 5;
 
 function createOTP() {
     return crypto.randomInt(100000, 1000000).toString();
+}
+
+const LOGO_URL = `${process.env.CLIENT_URL}/logo.png`;
+
+function buildOTPHtml(otp) {
+    return `
+<!DOCTYPE html>
+<html>
+  <body style="margin:0;padding:0;background:#f4f4f7;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f4f4f7;padding:24px 0;">
+      <tr>
+        <td align="center">
+          <table role="presentation" width="480" cellpadding="0" cellspacing="0" style="max-width:480px;width:100%;background:#ffffff;border-radius:8px;padding:32px;font-family:Arial,Helvetica,sans-serif;color:#333;">
+            <tr>
+              <td align="center">
+                <img src="${LOGO_URL}" alt="GUPSHUP" width="120" style="display:block;margin:0 auto 24px;border:0;" />
+                <h2 style="margin:0 0 12px;font-size:20px;color:#111;">Verify your email</h2>
+                <p style="margin:0 0 20px;font-size:14px;line-height:1.5;color:#555;">
+                  We received a request to verify the email address associated with your GUPSHUP account. Your verification code is:
+                </p>
+                <p style="margin:0 0 20px;font-size:34px;font-weight:bold;letter-spacing:8px;color:#111;">${otp}</p>
+                <p style="margin:0 0 20px;font-size:13px;color:#666;">
+                  This code is valid for 5 minutes and can be used only once.
+                </p>
+                <p style="margin:0;font-size:12px;line-height:1.5;color:#888;">
+                  Please do not share this code with anyone. GUPSHUP will never ask you for your verification code or password.
+                  If you did not request this code, you can safely ignore this email.
+                </p>
+              </td>
+            </tr>
+          </table>
+          <p style="font-size:12px;color:#999;margin:16px 0 0;font-family:Arial,sans-serif;">
+            This is an automated message. Please do not reply.
+          </p>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>`;
 }
 
 async function sendOTPEmail(email, otp) {
@@ -21,14 +60,12 @@ async function sendOTPEmail(email, otp) {
             sender: { name: "GUPSHUP", email: process.env.BREVO_SENDER_EMAIL },
             to: [{ email }],
             subject: "Your GUPSHUP Verification Code",
-            textContent: `
-Dear User,
+            htmlContent: buildOTPHtml(otp),
+            textContent: `Dear User,
 
 We received a request to verify the email address associated with your GUPSHUP account.
 
-Your verification code is:
-
-${otp}
+Your verification code is: ${otp}
 
 This verification code is valid for 5 minutes and can be used only once.
 
@@ -39,8 +76,7 @@ If you did not request this verification code, no further action is required. Yo
 This is an automated message. Please do not reply to this email.
 
 Regards,
-GUPSHUP Team
-`,
+GUPSHUP Team`,
         }),
     });
 
