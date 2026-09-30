@@ -9,13 +9,22 @@ const { formatMessage } = chatService;
 const PUBLIC = 'username firstname avatar';
 const MAX_GROUP_SIZE = 50;
 const PAGE_SIZE = 30;
+const MAX_GROUP_AVATAR_BYTES = 150 * 1024; // CHANGED: decoded size cap for group avatars
 
 const isId = (v) => typeof v === 'string' && /^[0-9a-f]{24}$/i.test(v);
 const getPairKey = (a, b) => [String(a), String(b)].sort().join('_');
 
-// CHANGED: now respects err.status (set by chatService) instead of always
-// returning 500 — required so sendMessage/deleteMessage/markRead keep their
-// original 400/403/404 status codes after delegating to the shared service.
+// CHANGED: same rules as profile avatars (data URL only, never a remote URL)
+function validateGroupAvatar(avatar) {
+    if (typeof avatar !== 'string') return "Invalid avatar";
+    const match = avatar.match(/^data:image\/(png|jpeg|jpg|webp);base64,([A-Za-z0-9+/=]+)$/);
+    if (!match) return "Avatar must be a PNG, JPEG, or WEBP image";
+    const decodedSize = Math.ceil((match[2].length * 3) / 4);
+    if (decodedSize > MAX_GROUP_AVATAR_BYTES) return "Avatar image is too large";
+    return null;
+}
+
+// respects err.status (set by chatService) instead of always returning 500
 const fail = (res, err) => {
     if (err && err.status) return res.status(err.status).json({ message: err.message });
     console.error(err);
@@ -85,7 +94,7 @@ const openDirectChat = async (req, res) => {
     }
 };
 
-// 2. Home screen: all my chats — unchanged
+// 2. Home screen: all my chats
 const getChatList = async (req, res) => {
     try {
         const me = req.result._id;
@@ -136,6 +145,8 @@ const getChatList = async (req, res) => {
             _id: c._id,
             type: c.type,
             name: c.type === 'group' ? c.name : undefined,
+            avatar: c.type === 'group' ? (c.avatar || null) : undefined,        // CHANGED
+            createdAt: c.type === 'group' ? c.createdAt : undefined,            // CHANGED
             user: c.type === 'direct' ? (otherByChat.get(String(c._id)) ?? null) : undefined,
             canSend: c.type === 'group' || friendKeys.has(c.pairKey),
             lastMessage: c.lastMessage ? formatMessage(c.lastMessage) : null,
@@ -176,13 +187,11 @@ const createGroup = async (req, res) => {
             })),
         ]);
 
-        // NEW / optional: lets added members see the group appear live.
-        // Delete these two lines if you don't want it — response body below is unchanged either way.
         const io = req.app.get('io');
         ids.forEach((userId) => io.to(userId).emit('chat:new', { conversation: { _id: conversation._id, type: 'group', name: conversation.name } }));
 
         res.status(201).json({
-            conversation: { _id: conversation._id, type: 'group', name: conversation.name },
+            conversation: { _id: conversation._id, type: 'group', name: conversation.name, createdAt: conversation.createdAt },
             message: "Group created",
         });
     } catch (err) {
@@ -225,7 +234,6 @@ const addGroupMembers = async (req, res) => {
             },
         })));
 
-        // NEW / optional real-time notifications — delete if unwanted
         const io = req.app.get('io');
         const summary = { _id: conversationId, type: 'group', name: group.name };
         ids.forEach((userId) => io.to(userId).emit('chat:new', { conversation: summary }));
@@ -237,7 +245,66 @@ const addGroupMembers = async (req, res) => {
     }
 };
 
-// 5. Delete my own message — now delegates to chatService, response shape unchanged
+// NEW: edit group name and/or avatar (creator only)
+const updateGroup = async (req, res) => {
+    try {
+        const me = req.result._id;
+        const { conversationId } = req.params;
+        if (!isId(conversationId)) return res.status(400).json({ message: "Invalid chat" });
+
+        const body = req.body || {};
+        const set = {};
+        const unset = {};
+
+        if (body.name !== undefined) {
+            if (typeof body.name !== 'string' || !body.name.trim() || body.name.trim().length > 50)
+                return res.status(400).json({ message: "Group name must be 1 to 50 characters" });
+            set.name = body.name.trim();
+        }
+
+        if (body.avatar !== undefined) {
+            if (body.avatar === null) {
+                unset.avatar = "";
+            } else {
+                const err = validateGroupAvatar(body.avatar);
+                if (err) return res.status(400).json({ message: err });
+                set.avatar = body.avatar;
+            }
+        }
+
+        const update = {};
+        if (Object.keys(set).length) update.$set = set;
+        if (Object.keys(unset).length) update.$unset = unset;
+        if (!Object.keys(update).length)
+            return res.status(400).json({ message: "Nothing to update" });
+
+        const [isCreator, group] = await Promise.all([
+            Member.exists({ conversation: conversationId, user: me, role: 'creator' }),
+            Conversation.findOne({ _id: conversationId, type: 'group' }).select('_id').lean(),
+        ]);
+        if (!isCreator || !group)
+            return res.status(403).json({ message: "Only the group creator can edit the group" });
+
+        const updated = await Conversation.findByIdAndUpdate(conversationId, update, { new: true, runValidators: true })
+            .select('name avatar')
+            .lean();
+
+        // tell every member (even those with the chat closed) so their screen updates live
+        const io = req.app.get('io');
+        const members = await Member.find({ conversation: conversationId }).select('user').lean();
+        const payload = { conversationId, name: updated.name, avatar: updated.avatar || null };
+        members.forEach((m) => io.to(String(m.user)).emit('group:updated', payload));
+
+        res.status(200).json({
+            group: { _id: updated._id, name: updated.name, avatar: updated.avatar || null },
+            message: "Group updated",
+        });
+    } catch (err) {
+        fail(res, err);
+    }
+};
+
+// 5. Delete my own message
 const deleteMessage = async (req, res) => {
     try {
         const { messageId } = req.params;
@@ -289,7 +356,7 @@ const getMessages = async (req, res) => {
     }
 };
 
-// 4. Send a text message — now delegates to chatService, response shape unchanged
+// 4. Send a text message
 const sendMessage = async (req, res) => {
     try {
         const me = req.result._id;
@@ -304,7 +371,7 @@ const sendMessage = async (req, res) => {
     }
 };
 
-// 6. Mark the chat as read — now delegates to chatService, response shape unchanged
+// 6. Mark the chat as read
 const markRead = async (req, res) => {
     try {
         const { conversationId } = req.params;
@@ -354,7 +421,6 @@ const leaveGroup = async (req, res) => {
         const myMembership = await Member.findOneAndDelete({ conversation: conversationId, user: me });
         if (!myMembership) return res.status(404).json({ message: "You are not in this group" });
 
-        // NEW / optional
         const io = req.app.get('io');
         io.to(conversationId).emit('group:memberLeft', { conversationId, userId: String(me) });
 
@@ -367,7 +433,7 @@ const leaveGroup = async (req, res) => {
             ]);
         } else if (myMembership.role === 'creator') {
             await Member.updateOne({ _id: remaining[0]._id }, { role: 'creator' });
-            io.to(conversationId).emit('group:newCreator', { conversationId, userId: String(remaining[0].user) }); // NEW / optional
+            io.to(conversationId).emit('group:newCreator', { conversationId, userId: String(remaining[0].user) });
         }
 
         res.status(200).json({ message: "Left the group" });
@@ -396,7 +462,6 @@ const removeMember = async (req, res) => {
         const removed = await Member.findOneAndDelete({ conversation: conversationId, user: userId });
         if (!removed) return res.status(404).json({ message: "Member not found" });
 
-        // NEW / optional
         const io = req.app.get('io');
         io.to(conversationId).emit('group:memberRemoved', { conversationId, userId });
         io.to(userId).emit('group:removedFrom', { conversationId });
@@ -408,6 +473,6 @@ const removeMember = async (req, res) => {
 };
 
 module.exports = {
-    openDirectChat, getChatList, createGroup, addGroupMembers,
+    openDirectChat, getChatList, createGroup, addGroupMembers, updateGroup,
     deleteMessage, getMessages, sendMessage, markRead, getMembers, leaveGroup, removeMember,
 };

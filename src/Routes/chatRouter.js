@@ -1,11 +1,12 @@
 const express = require('express');
 const chatRouter = express.Router();
 const userMiddleware = require('../Middleware/userMiddleware');
-const {openDirectChat, getChatList, getMessages, sendMessage,deleteMessage, markRead, createGroup, addGroupMembers, getMembers, leaveGroup, removeMember} = require('../Controller/userChat');
+const {openDirectChat, getChatList, getMessages, sendMessage,deleteMessage, markRead, createGroup, addGroupMembers, getMembers, leaveGroup, removeMember, updateGroup} = require('../Controller/userChat');
 
 chatRouter.post('/direct/:userId', userMiddleware, openDirectChat);
 chatRouter.get('/list', userMiddleware, getChatList);
 chatRouter.post('/group', userMiddleware, createGroup);
+chatRouter.patch('/group/:conversationId', userMiddleware, updateGroup); // CHANGED: edit group name / avatar (creator only)
 chatRouter.post('/group/:conversationId/members', userMiddleware, addGroupMembers);
 chatRouter.delete('/messages/:messageId', userMiddleware, deleteMessage);
 chatRouter.get('/:conversationId/messages', userMiddleware, getMessages);
@@ -27,3 +28,4 @@ module.exports = chatRouter;
 // 7    POST	    /chat/group	                            Create a group
 // 8    POST	    /chat/group/:conversationId/members	    Add friends to a group (creator only)
 // 9    GET	        /chat/:conversationId/members	        See who is in a chat
+// 10   PATCH	    /chat/group/:conversationId	            Edit group name / avatar (creator only)
